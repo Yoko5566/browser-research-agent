@@ -11,10 +11,44 @@ function safeFileName(text) {
     .slice(0, 80) || 'page';
 }
 
+function csvEscape(value) {
+  const text = String(value ?? '');
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function appendSourceRecord(record) {
+  const csvPath = path.join('outputs', 'sources.csv');
+
+  const header = [
+    'captured_at',
+    'title',
+    'original_url',
+    'final_url',
+    'raw_markdown_path',
+    'clean_markdown_path',
+    'screenshot_path'
+  ].join(',');
+
+  const row = [
+    record.capturedAt,
+    record.title,
+    record.originalUrl,
+    record.finalUrl,
+    record.rawMarkdownPath,
+    record.cleanMarkdownPath,
+    record.screenshotPath
+  ].map(csvEscape).join(',');
+
+  if (!fs.existsSync(csvPath)) {
+    fs.writeFileSync(csvPath, header + '\n', 'utf8');
+  }
+
+  fs.appendFileSync(csvPath, row + '\n', 'utf8');
+}
+
 function cleanText(rawText, title) {
   let text = rawText || '';
 
-  // 1. Try to start from the article title instead of the top navigation.
   const shortTitle = (title || '').split('|')[0].trim();
   const titleIndex = shortTitle ? text.indexOf(shortTitle) : -1;
 
@@ -22,7 +56,6 @@ function cleanText(rawText, title) {
     text = text.slice(titleIndex);
   }
 
-  // 2. Stop only when we reach real end-of-article markers.
   const stopMarkers = [
     'TAGS / KEYWORDS:',
     'IS THIS ARTICLE USEFUL?',
@@ -40,7 +73,6 @@ function cleanText(rawText, title) {
     }
   }
 
-  // 3. Remove common noisy lines but do not cut the whole article.
   const noisyLines = new Set([
     'ePaper',
     'Events',
@@ -165,10 +197,21 @@ ${cleanedText.slice(0, 10000)}
   fs.writeFileSync(rawMarkdownPath, rawMarkdown, 'utf8');
   fs.writeFileSync(cleanMarkdownPath, cleanMarkdown, 'utf8');
 
+  appendSourceRecord({
+    capturedAt: now.toISOString(),
+    title,
+    originalUrl: url,
+    finalUrl,
+    rawMarkdownPath,
+    cleanMarkdownPath,
+    screenshotPath
+  });
+
   console.log('Capture completed.');
   console.log(`Raw Markdown: ${rawMarkdownPath}`);
   console.log(`Clean Markdown: ${cleanMarkdownPath}`);
   console.log(`Screenshot: ${screenshotPath}`);
+  console.log('Source record added: outputs\\sources.csv');
 
   await browser.close();
 })();
