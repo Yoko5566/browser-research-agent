@@ -1,166 +1,80 @@
 const { chromium } = require('playwright');
 const fs = require('fs');
-const path = require('path');
+const {
+  appendSourceRecord,
+  buildOutputPaths,
+  cleanText,
+  ensureOutputDirectories,
+  validateUrl
+} = require('./capture_utils');
 
-function safeFileName(text) {
-  return text
-    .toLowerCase()
-    .replace(/^https?:\/\//, '')
-    .replace(/[^a-z0-9\u4e00-\u9fa5]+/gi, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 80) || 'page';
+const DEFAULT_TIMEOUT_MS = 60000;
+
+function parseArguments(args) {
+  const options = { headless: false, timeoutMs: DEFAULT_TIMEOUT_MS, url: null };
+  for (const argument of args) {
+    if (argument === '--headless') options.headless = true;
+    else if (argument === '--headed') options.headless = false;
+    else if (argument.startsWith('--timeout=')) {
+      const timeoutMs = Number(argument.slice('--timeout='.length));
+      if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+        throw new Error(`Invalid timeout: ${argument}`);
+      }
+      options.timeoutMs = timeoutMs;
+    } else if (!options.url) options.url = argument;
+    else throw new Error(`Unexpected argument: ${argument}`);
+  }
+  if (!options.url) {
+    throw new Error('Usage: node scripts/capture_page.js <url> [--headless] [--timeout=<ms>]');
+  }
+  options.url = validateUrl(options.url);
+  return options;
 }
 
-function csvEscape(value) {
-  const text = String(value ?? '');
-  return `"${text.replace(/"/g, '""')}"`;
+function formatNavigationError(error, url, timeoutMs) {
+  if (error && error.name === 'TimeoutError') {
+    return new Error(`Navigation timed out after ${timeoutMs} ms: ${url}`);
+  }
+  return new Error(`Navigation failed for ${url}: ${error.message}`);
 }
 
-function appendSourceRecord(record) {
-  const csvPath = path.join('outputs', 'sources.csv');
-
-  const header = [
-    'captured_at',
-    'title',
-    'original_url',
-    'final_url',
-    'raw_markdown_path',
-    'clean_markdown_path',
-    'screenshot_path'
-  ].join(',');
-
-  const row = [
-    record.capturedAt,
-    record.title,
-    record.originalUrl,
-    record.finalUrl,
-    record.rawMarkdownPath,
-    record.cleanMarkdownPath,
-    record.screenshotPath
-  ].map(csvEscape).join(',');
-
-  if (!fs.existsSync(csvPath)) {
-    fs.writeFileSync(csvPath, header + '\n', 'utf8');
-  }
-
-  fs.appendFileSync(csvPath, row + '\n', 'utf8');
-}
-
-function cleanText(rawText, title) {
-  let text = rawText || '';
-
-  const shortTitle = (title || '').split('|')[0].trim();
-  const titleIndex = shortTitle ? text.indexOf(shortTitle) : -1;
-
-  if (titleIndex !== -1) {
-    text = text.slice(titleIndex);
-  }
-
-  const stopMarkers = [
-    'TAGS / KEYWORDS:',
-    'IS THIS ARTICLE USEFUL?',
-    'REPORT A MISTAKE',
-    'Others Also Read',
-    'Trending in News',
-    'Subscriptions',
-    'Copyright ©'
-  ];
-
-  for (const marker of stopMarkers) {
-    const index = text.indexOf(marker);
-    if (index !== -1) {
-      text = text.slice(0, index);
-    }
-  }
-
-  const noisyLines = new Set([
-    'ePaper',
-    'Events',
-    'R.AGE',
-    'mStar',
-    'StarProperty',
-    'StarCherish',
-    'StarCarsifu',
-    'StarSearch',
-    'myStarjob',
-    'Kuali',
-    'Kuntum',
-    'SuriaFM',
-    '988FM',
-    'Subscriptions',
-    'Log In',
-    'Toggle navigation',
-    'StarPlus',
-    'News',
-    'Asean+',
-    'ESG',
-    'Business',
-    'Sport',
-    'Metro',
-    'Lifestyle',
-    'Food',
-    'Tech',
-    'Education',
-    'Opinion',
-    'Videos',
-    'Photos',
-    'share',
-    'bookmark',
-    'STARPICKS'
-  ]);
-
-  const lines = text
-    .split('\n')
-    .map(line => line.trim())
-    .filter(line => line.length > 0)
-    .filter(line => !noisyLines.has(line))
-    .filter(line => !line.includes('WAN IFRA ASIA MEDIA AWARDS'))
-    .filter(line => !line.includes('MPI-PETRONAS JOURNALISM AWARDS'));
-
-  return lines.join('\n\n');
-}
-
-(async () => {
-  const url = process.argv[2];
-
-  if (!url) {
-    console.error('Usage: node scripts/capture_page.js <url>');
-    process.exit(1);
-  }
-
+async function capturePage({ url, headless = false, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+  const originalUrl = validateUrl(url);
   const now = new Date();
   const timestamp = now.toISOString().replace(/[:.]/g, '-');
+  let browser;
 
-  const browser = await chromium.launch({ headless: false });
-  const page = await browser.newPage();
+  ensureOutputDirectories();
+  try {
+    browser = await chromium.launch({ headless });
+    const page = await browser.newPage();
+    try {
+      await page.goto(originalUrl, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    } catch (error) {
+      throw formatNavigationError(error, originalUrl, timeoutMs);
+    }
 
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    const title = await page.title();
+    const finalUrl = page.url();
+    const paths = buildOutputPaths(timestamp, title || finalUrl);
+    const bodyText = await page.locator('body').innerText({ timeout: 10000 }).catch(() => '');
+    const cleanedText = cleanText(bodyText, title, finalUrl);
 
-  const title = await page.title();
-  const finalUrl = page.url();
-  const fileBase = `${timestamp}_${safeFileName(title || finalUrl)}`;
+    try {
+      await page.screenshot({ path: paths.screenshotPath, fullPage: true });
+    } catch (error) {
+      throw new Error(`Could not write screenshot ${paths.screenshotRelativePath}: ${error.message}`);
+    }
 
-  const screenshotPath = path.join('outputs', 'screenshots', `${fileBase}.png`);
-  const rawMarkdownPath = path.join('outputs', 'pages', `${fileBase}.md`);
-  const cleanMarkdownPath = path.join('outputs', 'summaries', `${fileBase}_summary_ready.md`);
-
-  const bodyText = await page.locator('body').innerText({ timeout: 10000 }).catch(() => '');
-  const cleanedText = cleanText(bodyText, title);
-
-  await page.screenshot({
-    path: screenshotPath,
-    fullPage: true
-  });
-
-  const rawMarkdown = `# Page Capture Report
+    const rawMarkdown = `# Page Capture Report
 
 ## Metadata
 
 - Title: ${title}
-- Original URL: ${url}
+- Original URL: ${originalUrl}
 - Final URL: ${finalUrl}
 - Captured At: ${now.toISOString()}
-- Screenshot: ${screenshotPath}
+- Screenshot: ${paths.screenshotRelativePath}
 
 ## Main Text
 
@@ -171,16 +85,15 @@ ${bodyText.slice(0, 12000)}
 - This is an automated raw capture.
 - Review manually before using as research evidence.
 `;
-
-  const cleanMarkdown = `# Research Summary Input
+    const cleanMarkdown = `# Research Summary Input
 
 ## Source
 
 - Title: ${title}
-- Original URL: ${url}
+- Original URL: ${originalUrl}
 - Final URL: ${finalUrl}
 - Captured At: ${now.toISOString()}
-- Screenshot: ${screenshotPath}
+- Screenshot: ${paths.screenshotRelativePath}
 
 ## Cleaned Article Text
 
@@ -194,24 +107,53 @@ ${cleanedText.slice(0, 10000)}
 - Follow-up questions:
 `;
 
-  fs.writeFileSync(rawMarkdownPath, rawMarkdown, 'utf8');
-  fs.writeFileSync(cleanMarkdownPath, cleanMarkdown, 'utf8');
+    try {
+      fs.writeFileSync(paths.rawMarkdownPath, rawMarkdown, 'utf8');
+      fs.writeFileSync(paths.cleanMarkdownPath, cleanMarkdown, 'utf8');
+      appendSourceRecord({
+        capturedAt: now.toISOString(), title, originalUrl, finalUrl,
+        rawMarkdownPath: paths.rawMarkdownRelativePath,
+        cleanMarkdownPath: paths.cleanMarkdownRelativePath,
+        screenshotPath: paths.screenshotRelativePath
+      }, paths.sourcesCsvPath);
+    } catch (error) {
+      throw new Error(`Could not write capture output: ${error.message}`);
+    }
 
-  appendSourceRecord({
-    capturedAt: now.toISOString(),
-    title,
-    originalUrl: url,
-    finalUrl,
-    rawMarkdownPath,
-    cleanMarkdownPath,
-    screenshotPath
-  });
+    return {
+      title, originalUrl, finalUrl,
+      rawMarkdownPath: paths.rawMarkdownPath,
+      cleanMarkdownPath: paths.cleanMarkdownPath,
+      screenshotPath: paths.screenshotPath,
+      sourcesCsvPath: paths.sourcesCsvPath,
+      rawMarkdownRelativePath: paths.rawMarkdownRelativePath,
+      cleanMarkdownRelativePath: paths.cleanMarkdownRelativePath,
+      screenshotRelativePath: paths.screenshotRelativePath,
+      sourcesCsvRelativePath: paths.sourcesCsvRelativePath
+    };
+  } finally {
+    if (browser) {
+      await browser.close().catch(error => {
+        console.error(`Warning: browser cleanup failed: ${error.message}`);
+      });
+    }
+  }
+}
 
-  console.log('Capture completed.');
-  console.log(`Raw Markdown: ${rawMarkdownPath}`);
-  console.log(`Clean Markdown: ${cleanMarkdownPath}`);
-  console.log(`Screenshot: ${screenshotPath}`);
-  console.log('Source record added: outputs\\sources.csv');
+async function main() {
+  try {
+    const result = await capturePage(parseArguments(process.argv.slice(2)));
+    console.log('Capture completed.');
+    console.log(`Raw Markdown: ${result.rawMarkdownRelativePath}`);
+    console.log(`Clean Markdown: ${result.cleanMarkdownRelativePath}`);
+    console.log(`Screenshot: ${result.screenshotRelativePath}`);
+    console.log(`Source record added: ${result.sourcesCsvRelativePath}`);
+  } catch (error) {
+    console.error(`Capture failed: ${error.message}`);
+    process.exitCode = 1;
+  }
+}
 
-  await browser.close();
-})();
+if (require.main === module) main();
+
+module.exports = { DEFAULT_TIMEOUT_MS, capturePage, parseArguments };
