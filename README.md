@@ -13,8 +13,8 @@ The project uses Node.js CommonJS and has no API, LLM, cloud-service, database, 
 ## Fresh-clone setup
 
 ```sh
-git clone <repository-url>
-cd browser_research_agent
+git clone https://github.com/Yoko5566/browser-research-agent.git
+cd browser-research-agent
 npm ci
 npx playwright install chromium
 npm test
